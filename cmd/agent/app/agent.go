@@ -29,7 +29,7 @@ func NewAgentCommand() *cobra.Command {
 				klog.Error(err)
 				return err
 			}
-			return client.Wait()
+			return nil
 		},
 	}
 

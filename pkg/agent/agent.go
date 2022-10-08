@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"kubesphere.io/tower/pkg/version"
 
 	"github.com/jpillora/backoff"
+	"sigs.k8s.io/controller-runtime/pkg/runtime/signals"
 )
 
 const (
@@ -36,8 +36,6 @@ type Agent struct {
 	options   *Options
 	sshConfig *ssh.ClientConfig
 	sshConn   ssh.Conn
-	running   bool
-	runningC  chan error
 	config    *Config
 }
 
@@ -85,10 +83,8 @@ func NewAgent(options *Options) (*Agent, error) {
 	}
 
 	agent := &Agent{
-		options:  options,
-		running:  true,
-		runningC: make(chan error, 1),
-		config:   conf,
+		options: options,
+		config:  conf,
 	}
 
 	agent.sshConfig = &ssh.ClientConfig{
@@ -103,55 +99,53 @@ func NewAgent(options *Options) (*Agent, error) {
 }
 
 func (agent *Agent) Run() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := agent.Start(ctx); err != nil {
-		return err
+	stopCh := signals.SetupSignalHandler()
+
+	if agent.options.KeepAlive > 0 {
+		go agent.keepAliveLoop(stopCh)
 	}
-	return agent.Wait()
+	go agent.connectionLoop(stopCh)
+	klog.Info("start agent successful.")
+
+	<-stopCh
+	klog.Info("stop agent.")
+	return nil
 }
 
 func (agent *Agent) verifyServer(hostname string, remote net.Addr, key ssh.PublicKey) error {
 	return nil
 }
 
-func (agent *Agent) Start(ctx context.Context) error {
-	if agent.options.KeepAlive > 0 {
-		go agent.keepAliveLoop()
-	}
-
-	go agent.connectionLoop()
-	return nil
-}
-
-func (agent *Agent) Wait() error {
-	return <-agent.runningC
-}
-
 func (agent *Agent) Close() error {
-	agent.running = false
 	if agent.sshConn == nil {
 		return nil
 	}
 	return agent.sshConn.Close()
 }
 
-func (agent *Agent) keepAliveLoop() {
-	for agent.running {
-		time.Sleep(agent.options.KeepAlive)
-		if agent.sshConn != nil {
-			agent.sshConn.SendRequest("ping", true, nil)
+func (agent *Agent) keepAliveLoop(stopCh <-chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			time.Sleep(agent.options.KeepAlive)
+			if agent.sshConn != nil {
+				agent.sshConn.SendRequest("ping", true, nil)
+			}
 		}
+
 	}
 }
 
-func (agent *Agent) connectionLoop() {
+func (agent *Agent) connectionLoop(stopCh <-chan struct{}) {
 	var connectionErr error
 	b := &backoff.Backoff{
 		Factor: 1.4, // for faster reconnection
 		Max:    agent.options.MaxRetryInterval,
 	}
-	for agent.running {
+
+	do := func() {
 		if connectionErr != nil {
 			attempt := int(b.Attempt())
 			maxAttempt := agent.options.MaxRetryCount
@@ -168,7 +162,7 @@ func (agent *Agent) connectionLoop() {
 			klog.Warning(msg)
 
 			if maxAttempt > 0 && attempt >= maxAttempt {
-				break
+				klog.Fatal("retry count reach max attempt.")
 			}
 			klog.Warningf("Retrying in %s...", d)
 			connectionErr = nil
@@ -195,7 +189,7 @@ func (agent *Agent) connectionLoop() {
 		wsConn, _, err := dialer.Dial(agent.options.Server, wsHeaders)
 		if err != nil {
 			connectionErr = err
-			continue
+			return
 		}
 
 		conn := utils.NewWebSocketConn(wsConn)
@@ -203,11 +197,10 @@ func (agent *Agent) connectionLoop() {
 		sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", agent.sshConfig)
 		if err != nil {
 			if strings.Contains(err.Error(), "unable to authenticate") {
-				klog.Error("Authentication failed", err)
+				klog.Fatal("Authentication failed", err)
 			} else {
-				klog.Error(err)
+				klog.Fatal(err)
 			}
-			break
 		}
 
 		conf, _ := agent.config.Marshal()
@@ -215,8 +208,7 @@ func (agent *Agent) connectionLoop() {
 		t0 := time.Now()
 		_, configErr, err := sshConn.SendRequest("config", true, conf)
 		if err != nil {
-			klog.Error("Config verification failed", err)
-			break
+			klog.Fatal("Config verification failed", err)
 		}
 
 		// we may encounter error like 'A session already allocated for this client.'
@@ -224,7 +216,7 @@ func (agent *Agent) connectionLoop() {
 		// see issue #29
 		if len(configErr) > 0 {
 			connectionErr = errors.New(string(configErr))
-			continue
+			return
 		}
 
 		klog.V(2).Infof("Connected (Latency %s)", time.Since(t0))
@@ -237,11 +229,20 @@ func (agent *Agent) connectionLoop() {
 		agent.sshConn = nil
 		if err != nil && err != io.EOF {
 			connectionErr = err
-			continue
+			klog.Error(err)
+			return
 		}
 		klog.V(2).Info("Disconnected")
 	}
-	close(agent.runningC)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			do()
+		}
+	}
 }
 
 func (agent *Agent) connectStreams(chans <-chan ssh.NewChannel) {
